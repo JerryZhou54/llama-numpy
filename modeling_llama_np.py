@@ -22,6 +22,7 @@ import math
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
+from matmul import shiftadd_matmul
 
 def prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds, past_key_values_length):
     # create causal mask
@@ -115,6 +116,8 @@ class LlamaConfig:
         attention_dropout=0.0,
         mlp_bias=False,
         head_dim=None,
+        nbits=3,
+        groupsize=128,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -140,6 +143,8 @@ class LlamaConfig:
         self.attention_dropout = attention_dropout
         self.mlp_bias = mlp_bias
         self.head_dim = head_dim if head_dim is not None else self.hidden_size // self.num_attention_heads
+        self.nbits = nbits
+        self.groupsize = groupsize
 
 class NumpyEmbedding:
     def __init__(self, vocab_size, embedding_dim):
@@ -234,19 +239,27 @@ class LlamaMLP():
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
 
-        std = config.initializer_range
-        self.gate_proj = std * np.random.randn(self.hidden_size, self.intermediate_size).astype(np.float32)
-        self.up_proj = std * np.random.randn(self.hidden_size, self.intermediate_size).astype(np.float32)
-        self.down_proj = std * np.random.randn(self.intermediate_size, self.hidden_size).astype(np.float32)
+        K, N = self.hidden_size, self.intermediate_size
+        nbits, groupsize = self.config.nbits, self.config.groupsize
+        # std = config.initializer_range
+        # self.gate_proj = std * np.random.randn(self.hidden_size, self.intermediate_size).astype(np.float32)
+        # self.up_proj = std * np.random.randn(self.hidden_size, self.intermediate_size).astype(np.float32)
+        # self.down_proj = std * np.random.randn(self.intermediate_size, self.hidden_size).astype(np.float32)
+        self.gate_proj_bW = np.random.randint(256, size=(K//8, nbits, N), dtype=np.uint8)
+        self.gate_proj_alpha = np.random.randn(K//8, N*8 // groupsize, nbits)
+        self.up_proj_bW = np.random.randint(256, size=(K//8, nbits, N), dtype=np.uint8)
+        self.up_proj_alpha = np.random.randn(K//8, N*8 // groupsize, nbits)
+        self.down_proj_bW = np.random.randint(256, size=(N//8, nbits, K), dtype=np.uint8)
+        self.down_proj_alpha = np.random.randn(N//8, K*8 // groupsize, nbits)
 
     def silu(self, x):
         return x * (1 / (1 + np.exp(-x)))
 
     def forward(self, x):
-        gate_out = np.dot(x, self.gate_proj)
-        up_out = np.dot(x, self.up_proj)
+        gate_out = shiftadd_matmul(self.gate_proj_bW, self.gate_proj_alpha, x)
+        up_out = shiftadd_matmul(self.up_proj_bW, self.up_proj_alpha, x)
         act = self.silu(gate_out) * up_out
-        output = np.dot(act, self.down_proj)
+        output = shiftadd_matmul(self.down_proj_bW, self.down_proj_alpha, act)
 
         return output
 
@@ -270,11 +283,23 @@ class LlamaAttention():
                 f" and `num_heads`: {self.num_heads})."
             )
 
-        std = config.initializer_range
-        self.q_proj = std * np.random.randn(self.hidden_size, self.num_heads * self.head_dim).astype(np.float32)
-        self.k_proj = std * np.random.randn(self.hidden_size, self.num_key_value_heads * self.head_dim).astype(np.float32)
-        self.v_proj = std * np.random.randn(self.hidden_size, self.num_key_value_heads * self.head_dim).astype(np.float32)
-        self.o_proj = std * np.random.randn(self.num_heads * self.head_dim, self.hidden_size).astype(np.float32)
+        assert self.num_heads == self.num_key_value_heads
+        K, N = self.hidden_size, self.num_heads * self.head_dim
+        nbits, groupsize = self.config.nbits, self.config.groupsize
+        # std = config.initializer_range
+        # self.q_proj = std * np.random.randn(self.hidden_size, self.num_heads * self.head_dim).astype(np.float32)
+        # self.k_proj = std * np.random.randn(self.hidden_size, self.num_key_value_heads * self.head_dim).astype(np.float32)
+        # self.v_proj = std * np.random.randn(self.hidden_size, self.num_key_value_heads * self.head_dim).astype(np.float32)
+        # self.o_proj = std * np.random.randn(self.num_heads * self.head_dim, self.hidden_size).astype(np.float32)
+        self.q_proj_bW = np.random.randint(256, size=(K//8, nbits, N), dtype=np.uint8)
+        self.k_proj_bW = np.random.randint(256, size=(K//8, nbits, N), dtype=np.uint8)
+        self.v_proj_bW = np.random.randint(256, size=(K//8, nbits, N), dtype=np.uint8)
+        self.o_proj_bW = np.random.randint(256, size=(N//8, nbits, K), dtype=np.uint8)
+
+        self.q_proj_alpha = np.random.randn(K//8, N*8 // groupsize, nbits)
+        self.k_proj_alpha = np.random.randn(K//8, N*8 // groupsize, nbits)
+        self.v_proj_alpha = np.random.randn(K//8, N*8 // groupsize, nbits)
+        self.o_proj_alpha = np.random.randn(N//8, K*8 // groupsize, nbits)
  
         self._init_rope()
 
@@ -316,9 +341,12 @@ class LlamaAttention():
     ):
         bsz, q_len, _ = hidden_states.shape
 
-        query_states = np.dot(hidden_states, self.q_proj)
-        key_states = np.dot(hidden_states, self.k_proj)
-        value_states = np.dot(hidden_states, self.v_proj)
+        # query_states = np.dot(hidden_states, self.q_proj)
+        # key_states = np.dot(hidden_states, self.k_proj)
+        # value_states = np.dot(hidden_states, self.v_proj)
+        query_states = shiftadd_matmul(self.q_proj_bW, self.q_proj_alpha, hidden_states)
+        key_states = shiftadd_matmul(self.k_proj_bW, self.k_proj_alpha, hidden_states)
+        value_states = shiftadd_matmul(self.v_proj_bW, self.v_proj_alpha, hidden_states)
 
         query_states = query_states.reshape(bsz, q_len, self.num_heads, self.head_dim).swapaxes(1, 2)
         key_states = key_states.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).swapaxes(1, 2)
@@ -376,7 +404,8 @@ class LlamaAttention():
         attn_output = np.swapaxes(attn_output, 1, 2)
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
-        attn_output = np.dot(attn_output, self.o_proj)
+        # attn_output = np.dot(attn_output, self.o_proj)
+        attn_output = shiftadd_matmul(self.o_proj_bW, self.o_proj_alpha, attn_output)
 
         if not output_attentions:
             attn_weights = None

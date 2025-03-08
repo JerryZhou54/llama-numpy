@@ -4,7 +4,7 @@ from modeling_llama_np import NumpyEmbedding, LlamaDecoderLayer, LlamaConfig, pr
 
 import numpy as np
 
-SEQ_LENGTH = 128
+SEQ_LENGTH = 16
 
 def load_weight(layer):
     X1 = layer.input_layernorm.weight.shape[0]
@@ -61,10 +61,10 @@ if __name__ == '__main__':
     layer = LlamaDecoderLayer(config)
 
     embedding = NumpyEmbedding(config.vocab_size, config.hidden_size)
-    load_embedding(embedding)
+    # load_embedding(embedding)
     inputs_embeds = embedding.forward(np.random.randint(config.vocab_size, size=(1, SEQ_LENGTH)))
 
-    load_weight(layer)
+    # load_weight(layer)
 
     hidden_states = inputs_embeds
     past_key_values = None
@@ -94,6 +94,7 @@ if __name__ == '__main__':
         output_attentions = True
         use_cache = True
 
+        print("Hidden States: ", hidden_states.shape)
         layer_outputs = layer.forward(
             hidden_states,
             attention_mask=attention_mask,
